@@ -4,11 +4,9 @@ import sys
 
 from utils import PacketHeader, compute_checksum
 
-HEADER_SIZE = 16
-
 
 def receiver(receiver_ip, receiver_port, window_size):
-    """Listen on socket and print received message to sys.stdout."""
+    """TODO: Listen on socket and print received message to sys.stdout."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind((receiver_ip, receiver_port))
 
@@ -21,14 +19,11 @@ def receiver(receiver_ip, receiver_port, window_size):
         # Receive packet; address includes both IP and port
         pkt, address = s.recvfrom(2048)
 
-        if len(pkt) < HEADER_SIZE:
-            continue
-
         # Extract header and payload
-        pkt_header = PacketHeader(pkt[:HEADER_SIZE])
-        msg = pkt[HEADER_SIZE : HEADER_SIZE + pkt_header.length]
+        pkt_header = PacketHeader(pkt[:16])
+        msg = pkt[16 : 16 + pkt_header.length]
 
-        # Verify checksum
+        # Verity checksum
         pkt_checksum = pkt_header.checksum
         pkt_header.checksum = 0
         computed_checksum = compute_checksum(pkt_header / msg)
@@ -41,7 +36,7 @@ def receiver(receiver_ip, receiver_port, window_size):
                 continue
             active = True
             sender_address = address
-            # Send ACK with seq_num=1
+            # Send ACK for START packet (seq_num=1)
             ack_header = PacketHeader(type=3, seq_num=1, length=0, checksum=0)
             ack_header.checksum = compute_checksum(ack_header)
             s.sendto(bytes(ack_header), sender_address)
@@ -59,7 +54,7 @@ def receiver(receiver_ip, receiver_port, window_size):
             if seq_num >= expected_seq + window_size:
                 continue
 
-            # Already received (duplicate or old packet): send cumulative ACK
+            # Duplicate or old packet: send cumulative ACK
             if seq_num < expected_seq:
                 ack_header = PacketHeader(type=3, seq_num=expected_seq, length=0, checksum=0)
                 ack_header.checksum = compute_checksum(ack_header)
@@ -70,7 +65,7 @@ def receiver(receiver_ip, receiver_port, window_size):
             if seq_num not in buffered:
                 buffered[seq_num] = msg
 
-            # Deliver in-order packets
+            # Deliver in-order packets to stdout
             while expected_seq in buffered:
                 sys.stdout.buffer.write(buffered.pop(expected_seq))
                 expected_seq += 1
