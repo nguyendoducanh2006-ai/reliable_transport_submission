@@ -6,115 +6,113 @@ import time
 
 from utils import PacketHeader, compute_checksum
 
-START = 0
-END = 1
-DATA = 2
-ACK = 3
 HEADER_SIZE = 16
 MAX_PAYLOAD_SIZE = 1472 - HEADER_SIZE
 RETRANSMIT_TIMEOUT = 0.5
 
 
-def make_packet(packet_type, seq_num, payload=b""):
-    header = PacketHeader(type=packet_type, seq_num=seq_num, length=len(payload), checksum=0)
-    header.checksum = compute_checksum(header / payload)
-    return bytes(header / payload)
-
-
-def parse_packet(raw):
-    if len(raw) < HEADER_SIZE:
-        return None
-    header = PacketHeader(raw[:HEADER_SIZE])
-    if header.length < 0 or len(raw) != HEADER_SIZE + header.length:
-        return None
-    payload = raw[HEADER_SIZE:]
-    checksum = header.checksum
-    header.checksum = 0
-    if compute_checksum(header / payload) != checksum:
-        return None
-    return header.type, header.seq_num, payload
-
-
-def wait_for_ack(sock, expected_seq, timeout):
-    deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        readable, _, _ = select.select([sock], [], [], remaining)
-        if not readable:
-            return False
-        parsed = parse_packet(sock.recvfrom(2048)[0])
-        if parsed is not None and parsed[0] == ACK and parsed[1] == expected_seq:
-            return True
-
-
 def sender(receiver_ip, receiver_port, window_size):
-    if window_size <= 0:
-        raise ValueError("window_size must be positive")
+    """Open socket and send message from sys.stdin."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    msg = sys.stdin.buffer.read()
 
-    destination = (receiver_ip, receiver_port)
-    message = sys.stdin.buffer.read()
-    packets = [
-        make_packet(DATA, seq_num, message[offset:offset + MAX_PAYLOAD_SIZE])
-        for seq_num, offset in enumerate(range(0, len(message), MAX_PAYLOAD_SIZE), start=1)
-    ]
+    # Split message into chunks
+    chunks = []
+    for offset in range(0, len(msg), MAX_PAYLOAD_SIZE):
+        chunks.append(msg[offset : offset + MAX_PAYLOAD_SIZE])
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        start_packet = make_packet(START, 0)
-        while True:
-            sock.sendto(start_packet, destination)
-            if wait_for_ack(sock, 1, RETRANSMIT_TIMEOUT):
-                break
+    # Build all DATA packets (seq_num starts from 1)
+    packets = []
+    for i, chunk in enumerate(chunks):
+        pkt_header = PacketHeader(type=2, seq_num=i + 1, length=len(chunk), checksum=0)
+        pkt_header.checksum = compute_checksum(pkt_header / chunk)
+        pkt = bytes(pkt_header / chunk)
+        packets.append(pkt)
 
-        base = 1
-        next_seq = 1
-        last_seq = len(packets)
-        window_sent = {}
-        timer_started = None
+    # Send START packet (seq_num=0) and wait for ACK (seq_num=1)
+    pkt_header = PacketHeader(type=0, seq_num=0, length=0, checksum=0)
+    pkt_header.checksum = compute_checksum(pkt_header)
+    start_pkt = bytes(pkt_header)
+    while True:
+        s.sendto(start_pkt, (receiver_ip, receiver_port))
+        readable, _, _ = select.select([s], [], [], RETRANSMIT_TIMEOUT)
+        if readable:
+            data, address = s.recvfrom(2048)
+            if len(data) >= HEADER_SIZE:
+                pkt_header = PacketHeader(data[:HEADER_SIZE])
+                pkt_checksum = pkt_header.checksum
+                pkt_header.checksum = 0
+                computed_checksum = compute_checksum(pkt_header)
+                if pkt_checksum == computed_checksum and pkt_header.type == 3 and pkt_header.seq_num == 1:
+                    break
 
-        while base <= last_seq:
-            while next_seq <= last_seq and next_seq < base + window_size:
-                packet = packets[next_seq - 1]
-                sock.sendto(packet, destination)
-                window_sent[next_seq] = packet
-                next_seq += 1
-                if timer_started is None:
-                    timer_started = time.monotonic()
+    # Sliding window: cumulative ACK (Go-Back-N)
+    base = 1
+    next_seq = 1
+    last_seq = len(packets)
+    window_sent = {}
+    timer_started = None
 
-            remaining = RETRANSMIT_TIMEOUT - (time.monotonic() - timer_started)
-            readable, _, _ = select.select([sock], [], [], max(0, remaining))
-            if readable:
-                parsed = parse_packet(sock.recvfrom(2048)[0])
-                if parsed is None or parsed[0] != ACK:
-                    continue
-                ack_seq = parsed[1]
-                if base < ack_seq <= next_seq:
-                    for seq_num in range(base, ack_seq):
-                        window_sent.pop(seq_num, None)
-                    base = ack_seq
-                    timer_started = time.monotonic() if base <= last_seq else None
-                continue
+    while base <= last_seq:
+        # Send packets within the window
+        while next_seq <= last_seq and next_seq < base + window_size:
+            pkt = packets[next_seq - 1]
+            s.sendto(pkt, (receiver_ip, receiver_port))
+            window_sent[next_seq] = pkt
+            next_seq += 1
+            if timer_started is None:
+                timer_started = time.monotonic()
 
-            for packet in window_sent.values():
-                sock.sendto(packet, destination)
-            timer_started = time.monotonic()
+        # Wait for ACK or timeout
+        remaining = RETRANSMIT_TIMEOUT - (time.monotonic() - timer_started)
+        readable, _, _ = select.select([s], [], [], max(0, remaining))
+        if readable:
+            data, address = s.recvfrom(2048)
+            if len(data) >= HEADER_SIZE:
+                pkt_header = PacketHeader(data[:HEADER_SIZE])
+                pkt_checksum = pkt_header.checksum
+                pkt_header.checksum = 0
+                computed_checksum = compute_checksum(pkt_header)
+                if pkt_checksum == computed_checksum and pkt_header.type == 3:
+                    ack_seq = pkt_header.seq_num
+                    if base < ack_seq <= next_seq:
+                        for seq in range(base, ack_seq):
+                            window_sent.pop(seq, None)
+                        base = ack_seq
+                        timer_started = time.monotonic() if base <= last_seq else None
+            continue
 
-        end_seq = last_seq + 1
-        end_packet = make_packet(END, end_seq)
-        sock.sendto(end_packet, destination)
-        wait_for_ack(sock, end_seq + 1, RETRANSMIT_TIMEOUT)
-    finally:
-        sock.close()
+        # Timeout: retransmit all packets in the window
+        for pkt in window_sent.values():
+            s.sendto(pkt, (receiver_ip, receiver_port))
+        timer_started = time.monotonic()
+
+    # Send END packet and wait for ACK (up to 500ms)
+    end_seq = last_seq + 1
+    pkt_header = PacketHeader(type=1, seq_num=end_seq, length=0, checksum=0)
+    pkt_header.checksum = compute_checksum(pkt_header)
+    end_pkt = bytes(pkt_header)
+    s.sendto(end_pkt, (receiver_ip, receiver_port))
+    readable, _, _ = select.select([s], [], [], RETRANSMIT_TIMEOUT)
+    if readable:
+        s.recvfrom(2048)
+
+    s.close()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("receiver_ip", help="The IP address of the host that receiver is running on")
-    parser.add_argument("receiver_port", type=int, help="The port number on which receiver is listening")
-    parser.add_argument("window_size", type=int, help="Maximum number of outstanding packets")
+    parser.add_argument(
+        "receiver_ip", help="The IP address of the host that receiver is running on"
+    )
+    parser.add_argument(
+        "receiver_port", type=int, help="The port number on which receiver is listening"
+    )
+    parser.add_argument(
+        "window_size", type=int, help="Maximum number of outstanding packets"
+    )
     args = parser.parse_args()
+
     sender(args.receiver_ip, args.receiver_port, args.window_size)
 
 

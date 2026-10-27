@@ -4,91 +4,107 @@ import sys
 
 from utils import PacketHeader, compute_checksum
 
-START = 0
-END = 1
-DATA = 2
-ACK = 3
 HEADER_SIZE = 16
 
 
-def make_ack(seq_num):
-    header = PacketHeader(type=ACK, seq_num=seq_num, length=0, checksum=0)
-    header.checksum = compute_checksum(header)
-    return bytes(header)
-
-
-def parse_packet(raw):
-    if len(raw) < HEADER_SIZE:
-        return None
-    header = PacketHeader(raw[:HEADER_SIZE])
-    if header.length < 0 or len(raw) != HEADER_SIZE + header.length:
-        return None
-    payload = raw[HEADER_SIZE:]
-    checksum = header.checksum
-    header.checksum = 0
-    if compute_checksum(header / payload) != checksum:
-        return None
-    return header.type, header.seq_num, payload
-
-
 def receiver(receiver_ip, receiver_port, window_size):
-    if window_size <= 0:
-        raise ValueError("window_size must be positive")
+    """Listen on socket and print received message to sys.stdout."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((receiver_ip, receiver_port))
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((receiver_ip, receiver_port))
     active = False
     sender_address = None
     expected_seq = 1
     buffered = {}
 
-    try:
-        while True:
-            raw, address = sock.recvfrom(2048)
-            parsed = parse_packet(raw)
-            if parsed is None:
+    while True:
+        # Receive packet; address includes both IP and port
+        pkt, address = s.recvfrom(2048)
+
+        if len(pkt) < HEADER_SIZE:
+            continue
+
+        # Extract header and payload
+        pkt_header = PacketHeader(pkt[:HEADER_SIZE])
+        msg = pkt[HEADER_SIZE : HEADER_SIZE + pkt_header.length]
+
+        # Verify checksum
+        pkt_checksum = pkt_header.checksum
+        pkt_header.checksum = 0
+        computed_checksum = compute_checksum(pkt_header / msg)
+        if pkt_checksum != computed_checksum:
+            continue
+
+        # Wait for START to initiate connection
+        if not active:
+            if pkt_header.type != 0 or pkt_header.seq_num != 0 or pkt_header.length != 0:
+                continue
+            active = True
+            sender_address = address
+            # Send ACK with seq_num=1
+            ack_header = PacketHeader(type=3, seq_num=1, length=0, checksum=0)
+            ack_header.checksum = compute_checksum(ack_header)
+            s.sendto(bytes(ack_header), sender_address)
+            continue
+
+        # Ignore packets from other senders or duplicate START
+        if address != sender_address or pkt_header.type == 0:
+            continue
+
+        # Handle DATA packets
+        if pkt_header.type == 2:
+            seq_num = pkt_header.seq_num
+
+            # Drop packets outside the window
+            if seq_num >= expected_seq + window_size:
                 continue
 
-            packet_type, seq_num, payload = parsed
-            if not active:
-                if packet_type != START or seq_num != 0 or payload:
-                    continue
-                active = True
-                sender_address = address
-                sock.sendto(make_ack(1), sender_address)
+            # Already received (duplicate or old packet): send individual ACK
+            if seq_num < expected_seq:
+                ack_header = PacketHeader(type=3, seq_num=seq_num, length=0, checksum=0)
+                ack_header.checksum = compute_checksum(ack_header)
+                s.sendto(bytes(ack_header), sender_address)
                 continue
 
-            if address != sender_address or packet_type == START:
-                continue
+            # Buffer in-order or out-of-order packet
+            if seq_num not in buffered:
+                buffered[seq_num] = msg
 
-            if packet_type == DATA:
-                if seq_num < expected_seq:
-                    sock.sendto(make_ack(seq_num), sender_address)
-                    continue
-                if seq_num >= expected_seq + window_size:
-                    continue
+            # Deliver in-order packets
+            while expected_seq in buffered:
+                sys.stdout.buffer.write(buffered.pop(expected_seq))
+                expected_seq += 1
+            sys.stdout.buffer.flush()
 
-                buffered.setdefault(seq_num, payload)
-                while expected_seq in buffered:
-                    sys.stdout.buffer.write(buffered.pop(expected_seq))
-                    expected_seq += 1
-                sys.stdout.buffer.flush()
-                sock.sendto(make_ack(seq_num), sender_address)
-                continue
+            # Send individual ACK (seq_num of the received packet)
+            ack_header = PacketHeader(type=3, seq_num=seq_num, length=0, checksum=0)
+            ack_header.checksum = compute_checksum(ack_header)
+            s.sendto(bytes(ack_header), sender_address)
+            continue
 
-            if packet_type == END and not payload and seq_num == expected_seq:
-                sock.sendto(make_ack(expected_seq + 1), sender_address)
-                return
-    finally:
-        sock.close()
+        # Handle END packet
+        if pkt_header.type == 1 and pkt_header.length == 0 and pkt_header.seq_num == expected_seq:
+            ack_header = PacketHeader(type=3, seq_num=expected_seq + 1, length=0, checksum=0)
+            ack_header.checksum = compute_checksum(ack_header)
+            s.sendto(bytes(ack_header), sender_address)
+            break
+
+    s.close()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("receiver_ip", help="The IP address of the host that receiver is running on")
-    parser.add_argument("receiver_port", type=int, help="The port number on which receiver is listening")
-    parser.add_argument("window_size", type=int, help="Maximum number of outstanding packets")
+    parser.add_argument(
+        "receiver_ip", help="The IP address of the host that receiver is running on"
+    )
+    parser.add_argument(
+        "receiver_port", type=int, help="The port number on which receiver is listening"
+    )
+    parser.add_argument(
+        "window_size", type=int, help="Maximum number of outstanding packets"
+    )
     args = parser.parse_args()
+
     receiver(args.receiver_ip, args.receiver_port, args.window_size)
 
 
