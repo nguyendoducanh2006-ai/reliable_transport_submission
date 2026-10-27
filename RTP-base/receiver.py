@@ -28,15 +28,17 @@ def receiver(receiver_ip, receiver_port, window_size):
         pkt_header.checksum = 0
         computed_checksum = compute_checksum(pkt_header / msg)
         if pkt_checksum != computed_checksum:
+            # print("checksums not match")
             continue
+        # print(msg)
 
-        # Wait for START to initiate connection
+        # Wait for START packet (type=0, seq_num=0) to initiate connection
         if not active:
             if pkt_header.type != 0 or pkt_header.seq_num != 0 or pkt_header.length != 0:
                 continue
             active = True
             sender_address = address
-            # Send ACK for START packet (seq_num=1)
+            # Send ACK for START packet (type=3, seq_num=1)
             ack_header = PacketHeader(type=3, seq_num=1, length=0, checksum=0)
             ack_header.checksum = compute_checksum(ack_header)
             s.sendto(bytes(ack_header), sender_address)
@@ -46,39 +48,40 @@ def receiver(receiver_ip, receiver_port, window_size):
         if address != sender_address or pkt_header.type == 0:
             continue
 
-        # Handle DATA packets
+        # Handle DATA packets (type=2)
         if pkt_header.type == 2:
             seq_num = pkt_header.seq_num
 
-            # Drop packets outside the window
+            # Drop packets outside the receiver window
             if seq_num >= expected_seq + window_size:
                 continue
 
-            # Duplicate or old packet: send cumulative ACK
+            # Duplicate or old packet: send cumulative ACK with current expected_seq
             if seq_num < expected_seq:
                 ack_header = PacketHeader(type=3, seq_num=expected_seq, length=0, checksum=0)
                 ack_header.checksum = compute_checksum(ack_header)
                 s.sendto(bytes(ack_header), sender_address)
                 continue
 
-            # Buffer in-order or out-of-order packet
+            # Buffer packet
             if seq_num not in buffered:
                 buffered[seq_num] = msg
 
-            # Deliver in-order packets to stdout
+            # Flush contiguous in-order packets to sys.stdout
             while expected_seq in buffered:
                 sys.stdout.buffer.write(buffered.pop(expected_seq))
                 expected_seq += 1
             sys.stdout.buffer.flush()
 
-            # Send cumulative ACK (next expected seq_num)
+            # Send cumulative ACK with next expected seq_num
             ack_header = PacketHeader(type=3, seq_num=expected_seq, length=0, checksum=0)
             ack_header.checksum = compute_checksum(ack_header)
             s.sendto(bytes(ack_header), sender_address)
             continue
 
-        # Handle END packet
+        # Handle END packet (type=1)
         if pkt_header.type == 1 and pkt_header.length == 0 and pkt_header.seq_num == expected_seq:
+            # Send ACK for END packet (type=3, seq_num=expected_seq + 1)
             ack_header = PacketHeader(type=3, seq_num=expected_seq + 1, length=0, checksum=0)
             ack_header.checksum = compute_checksum(ack_header)
             s.sendto(bytes(ack_header), sender_address)

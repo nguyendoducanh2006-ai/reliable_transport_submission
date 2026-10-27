@@ -10,6 +10,12 @@ from utils import PacketHeader, compute_checksum
 def sender(receiver_ip, receiver_port, window_size):
     """TODO: Open socket and send message from sys.stdin."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # pkt_header = PacketHeader(type=2, seq_num=10, length=14)
+    # pkt_header.checksum = compute_checksum(pkt_header / "Hello, world!\n")
+    # pkt = pkt_header / "Hello, world!\n"
+    # s.sendto(bytes(pkt), (receiver_ip, receiver_port))
+
+    # Read message to send from sys.stdin
     msg = sys.stdin.buffer.read()
 
     # Split message into chunks (1472 bytes max packet size - 16 bytes header = 1456 bytes payload)
@@ -22,10 +28,10 @@ def sender(receiver_ip, receiver_port, window_size):
     for i, chunk in enumerate(chunks):
         pkt_header = PacketHeader(type=2, seq_num=i + 1, length=len(chunk), checksum=0)
         pkt_header.checksum = compute_checksum(pkt_header / chunk)
-        pkt = bytes(pkt_header / chunk)
-        packets.append(pkt)
+        pkt = pkt_header / chunk
+        packets.append(bytes(pkt))
 
-    # Send START packet (seq_num=0) and wait for ACK (seq_num=1)
+    # Send START packet (type=0, seq_num=0) and wait for ACK (seq_num=1)
     pkt_header = PacketHeader(type=0, seq_num=0, length=0, checksum=0)
     pkt_header.checksum = compute_checksum(pkt_header)
     start_pkt = bytes(pkt_header)
@@ -58,7 +64,7 @@ def sender(receiver_ip, receiver_port, window_size):
             if timer_started is None:
                 timer_started = time.monotonic()
 
-        # Wait for ACK or timeout (500ms)
+        # Wait for ACK or 500ms timeout
         remaining = 0.5 - (time.monotonic() - timer_started)
         readable, _, _ = select.select([s], [], [], max(0, remaining))
         if readable:
@@ -81,7 +87,7 @@ def sender(receiver_ip, receiver_port, window_size):
             s.sendto(pkt, (receiver_ip, receiver_port))
         timer_started = time.monotonic()
 
-    # Send END packet and wait for ACK (up to 500ms)
+    # Send END packet (type=1) and wait for ACK (up to 500ms)
     end_seq = last_seq + 1
     pkt_header = PacketHeader(type=1, seq_num=end_seq, length=0, checksum=0)
     pkt_header.checksum = compute_checksum(pkt_header)
